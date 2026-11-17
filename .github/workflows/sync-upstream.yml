@@ -7,12 +7,11 @@ on:
 
 permissions:
   contents: write
-  actions: write
-  issues: write
+  pull-requests: write
 
 jobs:
   sync:
-    name: Sync with upstream root repo
+    name: Check upstream and create sync PR
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
@@ -34,36 +33,24 @@ jobs:
           echo "behind_count=$BEHIND_COUNT" >> "$GITHUB_OUTPUT"
           echo "Upstream has $BEHIND_COUNT new commit(s)"
 
-      - name: Merge upstream into fork
-        id: merge
+      - name: Push upstream-sync branch and open PR
         if: steps.check.outputs.behind_count != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git merge upstream/main --no-edit -m "chore: sync with upstream luqman-v1/9router-go"; then
-            echo "merged=true" >> "$GITHUB_OUTPUT"
-            git push origin main
-          else
-            echo "merged=false" >> "$GITHUB_OUTPUT"
-            CONFLICTS=$(git diff --name-only --diff-filter=U)
-            git merge --abort
-            echo "::error::Merge conflict detected with upstream/main"
-            echo "Conflicting files:"
-            echo "$CONFLICTS"
-            
-            EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open --search "Upstream sync conflict" --json number -q '.[0].number')
-            if [ -z "$EXISTING" ]; then
-              BODY=$(printf "Automatic sync with upstream (luqman-v1/9router-go:main) encountered merge conflicts.\n\nConflicted files:\n%s\n\nResolution steps:\n  git checkout main\n  git fetch upstream main\n  git merge upstream/main\n  # Resolve conflicts\n  git commit -m 'chore: merge upstream/main and resolve conflicts'\n  git push origin main" "$CONFLICTS")
-              gh issue create --repo "${{ github.repository }}" \
-                --title "⚠️ Upstream sync conflict detected" \
-                --body "$BODY"
-            fi
-            exit 1
-          fi
+          git checkout -B upstream-sync upstream/main
+          git push -f origin upstream-sync
 
-      - name: Trigger Docker build on sync
-        if: steps.check.outputs.behind_count != '0' && steps.merge.outputs.merged == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run docker.yml --ref main || true
+          EXISTING_PR=$(gh pr list --repo "${{ github.repository }}" --head upstream-sync --state open --json number -q '.[0].number')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Sync PR #$EXISTING_PR is already open and updated with latest commits."
+          else
+            UPSTREAM_COMMITS=$(git log --oneline -n "${{ steps.check.outputs.behind_count }}" upstream/main)
+            BODY=$(printf "### Upstream Sync\n\nNew commits detected on \`luqman-v1/9router-go:main\` (%s commit(s)):\n\n\`\`\`\n%s\n\`\`\`\n\nPlease review changes before merging into \`main\`. Merging to \`main\` will automatically trigger Docker build and push to Docker Hub." "${{ steps.check.outputs.behind_count }}" "$UPSTREAM_COMMITS")
+
+            gh pr create --repo "${{ github.repository }}" \
+              --base main \
+              --head upstream-sync \
+              --title "chore: sync with upstream luqman-v1/9router-go ($(date +'%Y-%m-%d'))" \
+              --body "$BODY"
+          fi

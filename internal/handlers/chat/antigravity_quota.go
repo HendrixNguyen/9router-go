@@ -210,9 +210,7 @@ func antigravityQuotaForModel(quotas map[string]AntigravityModelQuota, model str
 			candidates = append(candidates, q)
 		}
 	}
-	for _, q := range antigravityFamilyQuotas(quotas, model) {
-		candidates = append(candidates, q)
-	}
+	candidates = append(candidates, antigravityFamilyQuotas(quotas, model)...)
 	if len(candidates) == 0 {
 		return AntigravityModelQuota{}, false
 	}

@@ -1,0 +1,47 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    name: Sync with upstream root repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch and check upstream
+        id: check
+        run: |
+          git remote add upstream https://github.com/luqman-v1/9router-go.git
+          git fetch upstream main
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/main)
+          echo "behind_count=$BEHIND_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Upstream has $BEHIND_COUNT new commit(s)"
+
+      - name: Merge upstream into fork
+        if: steps.check.outputs.behind_count != '0'
+        run: |
+          git merge upstream/main --no-edit -m "chore: sync with upstream luqman-v1/9router-go"
+          git push origin main
+
+      - name: Trigger Docker build on sync
+        if: steps.check.outputs.behind_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run docker.yml --ref main || true

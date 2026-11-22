@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"9router/proxy/internal/browsercookies"
 	"9router/proxy/internal/connlimit"
 	"9router/proxy/internal/handlers/chat"
 	"9router/proxy/internal/handlerutil"
@@ -145,9 +146,9 @@ const (
 // (registry features.usage).
 var usageSupportedProviders = []string{
 	"antigravity", "claude", "clinepass", "codebuddy-cn", "codebuddy-intl", "codex",
-	"commandcode", "commandcode-goat", "deepseek", "gemini-cli", "gemini-web", "github", "glm", "glm-cn",
+	"commandcode", "commandcode-goat", "deeprelay", "deepseek", "gemini-cli", "gemini-web", "github", "glm", "glm-cn",
 	"grok-cli", "groq", "kimi", "kiro", "minimax", "minimax-cn", "minimax-code",
-	"minimax-code-global", "ollama",
+	"minimax-code-global", "ollama", "opendesign",
 	"free-pi", "freebuff", "opencode-go", "opencode-zen", "qoder", "qoder-cn", "trae",
 	"vercel-ai-gateway", "xiaomi-mimo", "zed",
 	"zcode",
@@ -156,9 +157,9 @@ var usageSupportedProviders = []string{
 // usageApikeyProviders mirrors upstream USAGE_APIKEY_PROVIDERS
 // (registry features.usageApikey).
 var usageApikeyProviders = []string{
-	"clinepass", "codebuddy-cn", "codebuddy-intl", "commandcode", "commandcode-goat", "deepseek", "gemini-web", "glm",
+	"clinepass", "codebuddy-cn", "codebuddy-intl", "commandcode", "commandcode-goat", "deeprelay", "deepseek", "gemini-web", "glm",
 	"glm-cn", "groq", "kimi", "kiro", "minimax", "minimax-cn", "ollama",
-	"free-pi", "freebuff", "opencode-go", "opencode-zen", "qoder", "qoder-cn",
+	"free-pi", "freebuff", "opencode-go", "opencode-zen", "opendesign", "qoder", "qoder-cn",
 	"vercel-ai-gateway", "xiaomi-mimo",
 }
 
@@ -490,6 +491,22 @@ func (h *DashboardHandler) HandleCreateConnection(w http.ResponseWriter, r *http
 		}
 	}
 	if apiKey != "" {
+		// gemini-web's credential is the whole site Cookie header, and the
+		// modal hands it over as apiKey. A paste is often a Cookie-Editor JSON
+		// export, so render it once here: the row, every later probe and every
+		// chat turn then read the header form. A malformed export is refused at
+		// the boundary rather than stored and sent to the site as a header it
+		// cannot read. deepseek-web, grok-web, perplexity-web and uc-web are
+		// excluded: their apiKey is a token or a single cookie value, not a
+		// header, so the JSON-cookie parser must not read it.
+		if req.Provider == "gemini-web" {
+			normalized, err := browsercookies.NormalizeCookieHeaderInput(apiKey)
+			if err != nil {
+				handlerutil.WriteJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			apiKey = normalized
+		}
 		dataMap["apiKey"] = apiKey
 	}
 	if len(req.ProviderSpecificData) > 0 {
@@ -1083,7 +1100,8 @@ func (h *DashboardHandler) HandleExportProviderKeys(w http.ResponseWriter, r *ht
 }
 
 // HandleDeleteConnection handles DELETE /api/connections/{id}.
-// Calls DeleteProviderConnection.
+// Calls DeleteProviderConnectionWithCount and prunes combos when the last
+// connection for a non-keyless provider is removed.
 func (h *DashboardHandler) HandleDeleteConnection(w http.ResponseWriter, r *http.Request) {
 	id := getURLParam(r, "id")
 	if id == "" {
@@ -1091,11 +1109,15 @@ func (h *DashboardHandler) HandleDeleteConnection(w http.ResponseWriter, r *http
 		return
 	}
 
-	if err := h.Repo.DeleteProviderConnection(id); err != nil {
+	provider, remaining, err := h.Repo.DeleteProviderConnectionWithCount(r.Context(), id)
+	if err != nil {
 		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	connlimit.Close(id) // release breaker/backoff state so nothing leaks
+	if provider != "" && remaining == 0 {
+		h.pruneDeletedProviderFromCombosBestEffort(r.Context(), provider)
+	}
 
 	handlerutil.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "id": id})
 }

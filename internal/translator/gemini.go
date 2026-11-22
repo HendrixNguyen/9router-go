@@ -16,6 +16,10 @@ import (
 
 // GeminiStreamState holds translation state for Gemini stream chunks.
 type GeminiStreamState struct {
+	// RoleSent tracks whether the deferred `role: "assistant"` delta has been
+	// merged into the first real content/reasoning/tool_call delta. Empty
+	// prefill frames must not fabricate an assistant turn.
+	RoleSent         bool
 	MessageStartSent bool
 	MessageId        string
 	// SessionID is the conversation this stream belongs to, taken from the
@@ -29,10 +33,10 @@ type GeminiStreamState struct {
 	Usage                *OpenAIUsage
 	FinishReason         string
 	LastThoughtSignature string
-	// ToolCallCount counts functionCall parts emitted so far. It gives each
-	// OpenAI tool_call its own index (parallel calls must not share index 0)
-	// and turns a Gemini STOP into finish_reason "tool_calls" so clients like
-	// Zed run the tools instead of ending the turn.
+	// APIKeyId scopes bare-key thought signatures when a client sends no
+	// session header, so two keys on one account never replay each other's
+	// signature through the shared tool_call_id namespace.
+	APIKeyId      string
 	ToolCallCount int
 }
 
@@ -240,8 +244,9 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 // TranslateOpenAIToGeminiWithSession is TranslateOpenAIToGemini for a request
 // that carries a conversation id. sessionID scopes the thought-signature
 // lookup, so a signature stored by another conversation on the same account is
-// never replayed here.
-func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string) ([]byte, error) {
+// never replayed here. When sessionID is empty and an apiKeyID is supplied,
+// bare-key lookups are namespaced to that key.
+func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string, apiKeyID ...string) ([]byte, error) {
 	var oreq struct {
 		Model               string         `json:"model"`
 		Messages            jsontext.Value `json:"messages"`
@@ -379,7 +384,11 @@ func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string) ([]
 				}
 				ts := extractThoughtSig(tc.ID)
 				if ts == "" {
-					ts = GetGeminiThoughtSignature(tc.ID, sessionID, oreq.Model)
+					var apiKey string
+					if len(apiKeyID) > 0 {
+						apiKey = apiKeyID[0]
+					}
+					ts = GetGeminiThoughtSignature(tc.ID, sessionID, oreq.Model, apiKey)
 				}
 				ts = NormalizeGeminiThoughtSignature(ts)
 				if ts == "" && !firstFunctionCallSeen {
@@ -891,10 +900,8 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 			"model":   state.Model,
 			"choices": []map[string]any{
 				{
-					"index": 0,
-					"delta": map[string]any{
-						"role": "assistant",
-					},
+					"index":         0,
+					"delta":         map[string]any{},
 					"finish_reason": nil,
 				},
 			},
@@ -943,7 +950,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 						if storeSession == "" {
 							storeSession = state.MessageId
 						}
-						StoreGeminiThoughtSignature(id, sig, storeSession, state.Model)
+						StoreGeminiThoughtSignature(id, sig, storeSession, state.Model, state.APIKeyId)
 						id += "__ts__" + sig
 					}
 					delta["tool_calls"] = []map[string]any{
@@ -960,6 +967,10 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 					state.ToolCallCount++
 				}
 				if len(delta) > 0 {
+					if !state.RoleSent {
+						delta["role"] = "assistant"
+						state.RoleSent = true
+					}
 					results = append(results, map[string]any{
 						"id":      state.MessageId,
 						"object":  "chat.completion.chunk",
@@ -1008,8 +1019,15 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 				"model":   state.Model,
 				"choices": []map[string]any{
 					{
-						"index":         0,
-						"delta":         map[string]any{},
+						"index": 0,
+						"delta": func() map[string]any {
+							d := map[string]any{}
+							if !state.RoleSent {
+								d["role"] = "assistant"
+								state.RoleSent = true
+							}
+							return d
+						}(),
 						"finish_reason": openAIStop,
 					},
 				},

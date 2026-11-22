@@ -333,6 +333,11 @@ func kiroUpstreamBody(req *Request) ([]byte, error) {
 
 // ForwardAzure forwards to Azure OpenAI with dynamic URL from env vars.
 func ForwardAzure(w http.ResponseWriter, req *Request) error {
+	fittedBody, toolNameMap := applyToolNameAlias(req)
+	if len(toolNameMap) > 0 {
+		req.Body = fittedBody
+		req.ToolNameMap = mergeToolNameMaps(req.ToolNameMap, toolNameMap)
+	}
 	var oreq struct {
 		Model string `json:"model"`
 	}
@@ -726,7 +731,7 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		// The free-tier gate fingerprints the lowercase tool quartet; capitalised
 		// variants from Claude Code CLI are renamed here and restored on the
 		// response (translator.ConcealFingerprintTools).
-		transformedBody, toolNameMap := translator.ConcealOpenCodeV2FingerprintTools(transformedBody, true, isOpenCodeAutoToolChoiceModel(cleanModel))
+		transformedBody, toolNameMap := shapeOpenCodeFreeBody(transformedBody, true, cleanModel)
 		transformedBody = translator.ApplyFingerprintSystemPrompt(transformedBody)
 		req.Ctx = translator.WithToolNameMap(req.Ctx, toolNameMap)
 		w = NewToolNameRestoringWriter(w, toolNameMap)
@@ -748,7 +753,7 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 			return forwardOpencodeRequest(ctx, req.Client, &cfg, apiKey, transformedBody, req.IsStream)
 		}, func() (*http.Response, error) {
 			return forwardOpencodeRequestDirect(ctx, &cfg, apiKey, transformedBody, req.IsStream)
-		}, rotateOpencodeStableSession(opencodeStableSessionKey(req, true), hint, func(session string) {
+		}, opencodeSessionRotation(req, true, hint, func(session string) {
 			cfg.StaticHeaders = proxy.BuildOpenCodeHeaders(baseHeaders, session, req.IsStream)
 		}))
 		if err != nil {
@@ -761,12 +766,18 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 			return &proxy.UpstreamError{StatusCode: resp.StatusCode, Body: errBody, Header: resp.Header}
 		}
 
+		// First SSE frame before the 200 head, same as the chat lane: a
+		// refusal or a stall must still be able to fail over.
+		responsesBody, ferr := awaitOpenCodeFirstEvent(ctx, resp, 0)
+		if ferr != nil {
+			return ferr
+		}
 		if req.IsStream {
-			stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, cfg.ResolveStallTimeout(proxy.ResolveDefaultStallTimeout()), "opencode-responses")
+			stallReader := proxy.NewStallReaderWithContext(ctx, responsesBody, cfg.ResolveStallTimeout(proxy.ResolveDefaultStallTimeout()), "opencode-responses")
 			defer stallReader.Close()
 			return handleCodexStream(w, req, stallReader)
 		}
-		return handleCodexStream(w, req, resp.Body)
+		return handleCodexStream(w, req, responsesBody)
 	}
 
 	body := InjectReasoningContent(req.Body, "opencode")
@@ -777,7 +788,7 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 	// there (upstream quirks.reasoningAliasFields).
 	req.LiftReasoningAliases = true
 	// opencode Chat Completions path: same conceal + restore of tool names.
-	body, toolNameMap := translator.ConcealOpenCodeV2FingerprintTools(body, false, isOpenCodeAutoToolChoiceModel(cleanModel))
+	body, toolNameMap := shapeOpenCodeFreeBody(body, false, cleanModel)
 	body = translator.ApplyFingerprintSystemPrompt(body)
 	req.Ctx = translator.WithToolNameMap(req.Ctx, toolNameMap)
 	w = NewToolNameRestoringWriter(w, toolNameMap)
@@ -813,7 +824,7 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		// Deterministic marshaling keeps the serialized request prefix
 		// stable across turns, which DeepSeek's prefix prompt cache
 		// requires; json/v2 randomizes map member order by default.
-		if b, err := marshalStable(reqMap); err == nil {
+		if b, err := marshalOpenCodeFreeChatBody(reqMap); err == nil {
 			body = b
 		}
 	}
@@ -833,7 +844,7 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		return forwardOpencodeRequest(ctx, req.Client, &cfg, apiKey, body, true)
 	}, func() (*http.Response, error) {
 		return forwardOpencodeRequestDirect(ctx, &cfg, apiKey, body, true)
-	}, rotateOpencodeStableSession(opencodeStableSessionKey(req, true), hint, func(session string) {
+	}, opencodeSessionRotation(req, true, hint, func(session string) {
 		cfg.StaticHeaders = proxy.BuildOpenCodeHeaders(baseHeaders, session, true)
 	}))
 	if err != nil {
@@ -846,10 +857,19 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		return &proxy.UpstreamError{StatusCode: resp.StatusCode, Body: errBody, Header: resp.Header}
 	}
 
-	if req.IsStream {
-		return execSSEStream(w, resp.Body, req)
+	// Read the first SSE frame before committing 200 OK. The free-tier gate can
+	// answer a refusal inside a 200 frame, or stall before its first one, and
+	// once the response head is on the wire no failover is possible — so this
+	// has to happen here rather than inside the stream writer.
+	streamBody, ferr := awaitOpenCodeFirstEvent(ctx, resp, 0)
+	if ferr != nil {
+		return ferr
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+
+	if req.IsStream {
+		return execSSEStream(w, streamBody, req)
+	}
+	data, err := io.ReadAll(io.LimitReader(streamBody, 10*1024*1024))
 	if err != nil {
 		return fmt.Errorf("read opencode response: %w", err)
 	}
@@ -1071,6 +1091,7 @@ func ensureMessagesFor(body []byte, provider, model string) []byte {
 	applyClaudeThinkingDisplay(reqMap)
 	applyClaudeThinkingType(reqMap, provider, model)
 	SanitizeClaudeThinking(reqMap)
+	applyClaudeThinkingOffAndToolChoice(reqMap, provider, model)
 	enforceClaudeThinkingSampling(reqMap)
 	delete(reqMap, "stream_options")
 	delete(reqMap, "store")
@@ -1110,6 +1131,65 @@ func enforceClaudeThinkingSampling(reqMap map[string]any) {
 	if hasTemp || hasTopP {
 		reqMap["temperature"] = 1.0
 		delete(reqMap, "top_p")
+	}
+}
+
+// applyClaudeThinkingOffAndToolChoice ports the Anthropic per-model rules that
+// upstream applies in formats/claude.js prepareClaudeRequest (decolua/9router
+// f3e1f716). Runs on every Claude-bound body so an OpenAI client, a native
+// passthrough and the provider-level "off" override are all covered.
+//
+//   - thinkingCanDisable:false: a model that cannot switch thinking off
+//     (Opus 5.5) must never see thinking.type "disabled" — upstream clamps the
+//     request to minimal effort, drops the thinking block and sets
+//     output_config.effort "low" (thinkingUnified.js applyFormat claude-adaptive).
+//   - thinkingOffType: a model that rejects thinking "disabled" (Sonnet 5.5) takes
+//     thinkingOffType ("between_tools") in its place, and between_tools only
+//     accepts effort up to high.
+//   - forcedToolChoice: a model that rejects forced tool_choice pinning
+//     ("any" or a named tool) gets tool_choice downgraded to "auto". "required"
+//     is left untouched, matching upstream, which only downgrades "any"/"tool".
+func applyClaudeThinkingOffAndToolChoice(reqMap map[string]any, provider, model string) {
+	caps := providers.GetCapabilitiesForModel(provider, model)
+	thinking, _ := reqMap["thinking"].(map[string]any)
+	disabled := thinking != nil && thinking["type"] == "disabled"
+
+	if disabled && !caps.CanDisableThinking() {
+		// thinking can't be switched off: clamp to minimal, drop the block,
+		// and carry the effort on output_config (upstream claude-adaptive).
+		delete(reqMap, "thinking")
+		outCfg, _ := reqMap["output_config"].(map[string]any)
+		if outCfg == nil {
+			outCfg = map[string]any{}
+			reqMap["output_config"] = outCfg
+		}
+		if _, set := outCfg["effort"]; !set {
+			outCfg["effort"] = "low"
+		}
+		disabled = false
+	}
+
+	if disabled && caps.ThinkingOffType != "" {
+		reqMap["thinking"] = map[string]any{"type": caps.ThinkingOffType}
+		if oc, _ := reqMap["output_config"].(map[string]any); oc != nil {
+			switch oc["effort"] {
+			case "xhigh", "max":
+				oc["effort"] = "high"
+			}
+		}
+	}
+
+	if !caps.CanForceToolChoice() {
+		if tc, _ := reqMap["tool_choice"].(map[string]any); tc != nil {
+			switch tc["type"] {
+			case "any", "tool":
+				graded := map[string]any{"type": "auto"}
+				if v, ok := tc["disable_parallel_tool_use"]; ok {
+					graded["disable_parallel_tool_use"] = v
+				}
+				reqMap["tool_choice"] = graded
+			}
+		}
 	}
 }
 
@@ -1313,7 +1393,9 @@ func convertOpenAIMessagesToClaude(messages []any) (systemText string, claudeMes
 		}
 		role, _ := msgMap["role"].(string)
 
-		if role == "system" {
+		// Anthropic allows only user/assistant/system; OpenAI's newer
+		// "developer" role is the same thing as system.
+		if role == "system" || role == "developer" {
 			switch c := msgMap["content"].(type) {
 			case string:
 				if strings.TrimSpace(c) != "" {
@@ -1717,7 +1799,7 @@ func opencodeGoInferenceBase(base string) string {
 // Responses lane upstream), v2 fingerprint, public credentials.
 func forwardOpencodeGoFree(w http.ResponseWriter, req *Request, cleanModel string) error {
 	body := InjectReasoningContent(req.Body, "opencode-go")
-	body, toolNameMap := translator.ConcealOpenCodeV2FingerprintTools(body, false, isOpenCodeAutoToolChoiceModel(cleanModel))
+	body, toolNameMap := shapeOpenCodeFreeBody(body, false, cleanModel)
 	body = translator.ApplyFingerprintSystemPrompt(body)
 	req.Ctx = translator.WithToolNameMap(req.Ctx, toolNameMap)
 	w = NewToolNameRestoringWriter(w, toolNameMap)
@@ -1737,7 +1819,7 @@ func forwardOpencodeGoFree(w http.ResponseWriter, req *Request, cleanModel strin
 		// the same keyless gate, so the same empty-answer failure applies.
 		clampOpenCodeOutputBudget(reqMap, "opencode-go", cleanModel)
 		includeStreamUsage(reqMap)
-		if b, err := marshalStable(reqMap); err == nil {
+		if b, err := marshalOpenCodeFreeChatBody(reqMap); err == nil {
 			body = b
 		}
 	}
@@ -1757,7 +1839,7 @@ func forwardOpencodeGoFree(w http.ResponseWriter, req *Request, cleanModel strin
 		return forwardOpencodeRequest(ctx, req.Client, &cfg, "public", body, true)
 	}, func() (*http.Response, error) {
 		return forwardOpencodeRequestDirect(ctx, &cfg, "public", body, true)
-	}, rotateOpencodeStableSession(opencodeStableSessionKey(req, true), hint, func(session string) {
+	}, opencodeSessionRotation(req, true, hint, func(session string) {
 		cfg.StaticHeaders = proxy.BuildOpenCodeHeaders(baseHeaders, session, true)
 	}))
 	if err != nil {
@@ -1767,13 +1849,22 @@ func forwardOpencodeGoFree(w http.ResponseWriter, req *Request, cleanModel strin
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
-		return &proxy.UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+		return &proxy.UpstreamError{StatusCode: resp.StatusCode, Body: errBody, Header: resp.Header}
+	}
+
+	// Read the first SSE frame before committing 200 OK. The free-tier gate can
+	// answer a refusal inside a 200 frame, or stall before its first one, and
+	// once the response head is on the wire no failover is possible — so this
+	// has to happen here rather than inside the stream writer.
+	streamBody, ferr := awaitOpenCodeFirstEvent(ctx, resp, 0)
+	if ferr != nil {
+		return ferr
 	}
 
 	if req.IsStream {
-		return execSSEStream(w, resp.Body, req)
+		return execSSEStream(w, streamBody, req)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	data, err := io.ReadAll(io.LimitReader(streamBody, 10*1024*1024))
 	if err != nil {
 		return fmt.Errorf("read opencode-go free response: %w", err)
 	}
@@ -1803,7 +1894,7 @@ func forwardOpencodeGoGemini(w http.ResponseWriter, req *Request, cleanModel, se
 		geminiURL = fmt.Sprintf("%s/%s:%s", base, cleanModel, action)
 	}
 
-	geminiBody, err := translator.TranslateOpenAIToGeminiWithSession(req.Body, req.SessionID)
+	geminiBody, err := translator.TranslateOpenAIToGeminiWithSession(req.Body, req.SessionID, req.APIKeyID)
 	if err != nil {
 		return fmt.Errorf("translate to Gemini for opencode-go: %w", err)
 	}

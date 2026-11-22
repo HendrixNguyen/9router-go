@@ -369,15 +369,32 @@ func ambientProxyAllowlist() *proxyAllowlist {
 // newSafeDialerForProxy returns NewSafeDialer's dialer with the given proxy
 // endpoints exempted from the private-IP guard. A nil allowlist behaves exactly
 // like NewSafeDialer.
+//
+// When strict is true the ALLOW_PRIVATE_NETWORKING and per-connection
+// WithAllowPrivateNetworking opt-outs are ignored: the dial refuses every
+// private/reserved address regardless of the operator's global setting. That is
+// the vision bridge's connect-time guard, which judges caller-supplied image
+// URLs and so cannot honour a setting that would let a private target through.
+// The ambient proxy endpoint is still exempted in both modes, so an operator's
+// egress proxy keeps working either way.
 func newSafeDialerForProxy(allow *proxyAllowlist) *net.Dialer {
+	return newSafeDialer(allow, false)
+}
+
+// newStrictSafeDialer is newSafeDialerForProxy with strict=true.
+func newStrictSafeDialer(allow *proxyAllowlist) *net.Dialer {
+	return newSafeDialer(allow, true)
+}
+
+func newSafeDialer(allow *proxyAllowlist, strict bool) *net.Dialer {
 	return &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 		ControlContext: func(ctx context.Context, network, address string, c syscall.RawConn) error {
-			if IsPrivateNetworkingAllowed() {
+			if !strict && IsPrivateNetworkingAllowed() {
 				return nil
 			}
-			if IsPrivateNetworkingAllowedFor(ctx) {
+			if !strict && IsPrivateNetworkingAllowedFor(ctx) {
 				return nil
 			}
 			host, _, err := net.SplitHostPort(address)
@@ -426,6 +443,20 @@ func NewSafeTransport() *http.Transport {
 	return t
 }
 
+// NewStrictSafeTransport is NewSafeTransport with an unconditional private-IP
+// guard: the dial refuses loopback / RFC1918 / link-local / metadata addresses
+// no matter how ALLOW_PRIVATE_NETWORKING is set, so a caller-supplied URL
+// (the vision bridge's remote image fetch) cannot walk the gateway into the
+// internal network. It keeps the operator's egress proxy: t.Proxy is the
+// ambient resolver and the dialer exempts that proxy endpoint, so a local
+// CONNECT proxy or sidecar still works — only the private *target* is refused.
+func NewStrictSafeTransport() *http.Transport {
+	t := constants.DefaultHTTPTransportConfig.NewTransport()
+	t.Proxy = proxyFromEnvironment
+	t.DialContext = newStrictSafeDialer(ambientProxyAllowlist()).DialContext
+	return t
+}
+
 // NewDirectSafeTransport is NewSafeTransport with the proxy disabled: it dials
 // the target from the host's own address even when the environment names a
 // proxy. Only callers whose PURPOSE is escaping an ambient proxy —
@@ -443,15 +474,42 @@ func NewDirectSafeTransport() *http.Transport {
 	return t
 }
 
+// DialableProxyScheme reports whether scheme names a proxy protocol the
+// standard transport can dial. Go's http.Transport speaks HTTP CONNECT
+// (http/https) and, natively, SOCKS5 (socks5/socks5h) — no external client and
+// no custom DialContext is involved.
+//
+// Callers use it to decide whether to install a proxy at all, so an
+// unrecognised scheme is refused where the URL is read rather than surfacing as
+// a dial-time failure after the connection has been committed to it.
+func DialableProxyScheme(scheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	}
+	return false
+}
+
+// ProxyURLDialable reports whether proxyURL names a scheme the standard
+// transport can dial.
+func ProxyURLDialable(proxyURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(proxyURL))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return DialableProxyScheme(u.Scheme)
+}
+
 // NewSafeTransportForProxy returns NewSafeTransport's transport for a caller
 // that installs its own proxy: the proxy is set on the transport and its
-// endpoint is exempted from the private-IP guard. An empty or unparseable
-// proxyURL falls back to the ambient path, so a malformed pool URL cannot
-// silently turn into a direct dial.
+// endpoint is exempted from the private-IP guard. An empty, unparseable, or
+// undialable proxyURL falls back to the ambient path, so a malformed pool URL
+// cannot silently turn into a direct dial, and a scheme the transport cannot
+// speak is refused here instead of failing at dial time.
 func NewSafeTransportForProxy(proxyURL string) *http.Transport {
 	t := constants.DefaultHTTPTransportConfig.NewTransport()
 	if proxyURL != "" {
-		if u, err := url.Parse(proxyURL); err == nil && u.Host != "" {
+		if u, err := url.Parse(proxyURL); err == nil && u.Host != "" && DialableProxyScheme(u.Scheme) {
 			t.Proxy = http.ProxyURL(u)
 			t.DialContext = newSafeDialerForProxy(newProxyAllowlist(u.Host)).DialContext
 			return t

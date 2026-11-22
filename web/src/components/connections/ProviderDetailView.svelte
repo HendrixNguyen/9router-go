@@ -32,6 +32,7 @@
   import { copyToClipboard } from '../../lib/clipboard'
   import { parseModelIds } from '../../lib/bulk-models'
   import { inferModelKind, customModelKeyFor } from '../../lib/modelKindInference'
+  import type { CustomModelType } from './modelTypeOptions'
   import {
     importCustomModelsBestEffort,
     notifyCustomModelsChanged,
@@ -50,6 +51,7 @@
     getIconPath,
     isChatModel,
     isConnectionError,
+    providerDisplayPrefix,
     type CustomModelData,
     type ModelItem,
     type SuggestedModel
@@ -100,6 +102,11 @@
   import FreebuffSessionBanner from './FreebuffSessionBanner.svelte'
   import FreebuffAdBanner from './FreebuffAdBanner.svelte'
   import ProviderIcon from './ProviderIcon.svelte'
+  import {
+    computeProviderThinkingOptions,
+    formatThinkingOptionLabel,
+    resolveProviderThinkingSuffix,
+  } from './providerThinking'
 
   interface Props {
     providerId: string
@@ -320,7 +327,7 @@
       // model unreachable: correctly absent from /v1/models, and equally absent
       // from the one screen that could remove it. The row carries its kind so
       // delete addresses the right key.
-      const full = `${storageAlias}/${cm.id}`
+      const full = `${displayAlias()}/${cm.id}`
       if (seen.has(full)) continue
       seen.add(full)
       // The kv store carries no per-row timestamp, so the add date is the
@@ -473,25 +480,21 @@
   // the catalog ships as a static bundle, but caps depend on the provider
   // registry, the capability tables and the synced models.dev catalog.
   let modelCaps = $state<Record<string, ModelCaps>>({})
-  // Union of the thinking levels this provider's models accept, with the
-  // explicit "auto" reset first — upstream providerThinkingLevels
-  // (dashboard/providers/[id]/page.js:186). null hides the picker entirely for a
-  // provider whose models have no reasoning.
-  let providerThinkingLevels = $derived.by(() => {
-    const levels = new Set<string>()
-    for (const m of allAvailableModels) {
-      for (const l of modelCaps[m.id]?.thinkingLevels ?? []) {
-        if (l !== 'none') levels.add(l)
-      }
-    }
-    return levels.size ? ['auto', ...levels] : null
-  })
+  // Options for the per-provider "Thinking:" picker: compatible nodes always
+  // offer auto/off/on even with no model capability metadata, and built-in
+  // providers include "off" whenever at least one model can disable thinking.
+  let providerThinkingLevels = $derived.by(() =>
+    computeProviderThinkingOptions({
+      modelThinkingLevels: toolbarRows.map((r) => r.thinkingLevels),
+      isCompatibleNode,
+      currentMode: thinkingLevel,
+    }),
+  )
   // A picked level only applies to a model that actually supports it, so the
-  // displayed id and the copied id never carry a level the provider rejects.
+  // displayed id and the copied id never carry a level the provider rejects
+  // or a switch mode like auto/off/on.
   function resolveThinkingSuffix(modelId: string): string | null {
-    if (!thinkingLevel || thinkingLevel === 'auto') return null
-    const levels = modelCaps[modelId]?.thinkingLevels
-    return levels && levels.includes(thinkingLevel) ? thinkingLevel : null
+    return resolveProviderThinkingSuffix(thinkingLevel, modelCaps[modelId]?.thinkingLevels)
   }
   // Compatible nodes (upstream CompatibleModelsSection): rows = custom models
   // + legacy aliases, both keyed by the node row id; display = node prefix.
@@ -599,7 +602,7 @@
     return dashboardCallbackURL(dashboardOrigin())
   }
 
-  function antigravityCallback(): string {
+  function loopbackCallback(): string {
     if (typeof window === 'undefined') return 'http://localhost:8080/callback'
     return oauthLoopbackCallbackURL(window.location.port, window.location.protocol === 'https:')
   }
@@ -682,7 +685,7 @@
     }
     window.addEventListener('storage', onStorage)
     const onWindowMessage = (e: MessageEvent) => {
-      const trustedOrigin = e.origin === window.location.origin || e.origin === new URL(antigravityCallback()).origin
+      const trustedOrigin = e.origin === window.location.origin || e.origin === new URL(loopbackCallback()).origin
       if (!trustedOrigin) return
       if (e.data?.type === 'oauth_callback' && e.data?.data) {
         const data = e.data.data as {
@@ -957,6 +960,7 @@
 
   // Load models, settings, proxy pools
   async function loadData() {
+    const pid = providerId
     try {
       const [modelsData, settingsData, poolsData, aliasesData, capsData] = await Promise.all([
         fetchProviderModelsData(providerId, storageAlias),
@@ -979,6 +983,7 @@
           ? api.getModelCaps(providerId).catch(() => ({ caps: {} as Record<string, ModelCaps> }))
           : Promise.resolve({ caps: {} as Record<string, ModelCaps> }),
       ])
+      if (pid !== providerId) return
       const capsById = capsData?.caps || {}
       // Same guard as the call above: an alias equal to the id would spend a
       // second round trip on a map we already have.
@@ -987,6 +992,7 @@
         const aliasCaps = await api
           .getModelCaps(storageAlias)
           .catch(() => ({ caps: {} as Record<string, ModelCaps> }))
+        if (pid !== providerId) return
         const aliasMap = aliasCaps?.caps || {}
         for (const [id, entry] of Object.entries(aliasMap)) {
           if (!capsMerged[id]) capsMerged[id] = entry
@@ -1187,6 +1193,7 @@
         if (lastLoadedProviderId !== pid) {
           lastLoadedProviderId = pid
           suggestedModels = []
+          thinkingLevel = 'auto'
         }
         loadData()
       })
@@ -1232,19 +1239,24 @@
   }
 
   async function handleThinkingChange(event: Event) {
-    const val = (event.target as HTMLSelectElement).value
+    const select = event.target as HTMLSelectElement
+    const prevLevel = thinkingLevel
+    const val = select.value
     thinkingLevel = val
+    const prevSettings = (settings as any)?.providerThinking
     try {
-      const current = (settings as any)?.providerThinking || {}
+      const current = prevSettings || {}
       const updated = { ...current }
       if (val && val !== 'auto') {
         updated[providerId] = { mode: val }
       } else {
         delete updated[providerId]
       }
-      if (settings) (settings as any).providerThinking = updated
       await api.updateSettings({ providerThinking: updated })
+      if (settings) (settings as any).providerThinking = updated
     } catch (err) {
+      thinkingLevel = prevLevel
+      if (settings) (settings as any).providerThinking = prevSettings
       console.error('Error saving provider thinking:', err)
     }
   }
@@ -1582,12 +1594,13 @@
   }
   // Add Connection Button flow
   async function handleAddConnectionClick() {
-    if (providerId === 'antigravity') {
-      const confirmed = typeof window !== 'undefined' && localStorage.getItem('ag_risk_confirmed') === 'true'
+    if (providerId === 'antigravity' || providerId === 'agy-acp') {
+      const riskKey = providerId === 'agy-acp' ? 'agcpy_risk_confirmed' : 'ag_risk_confirmed'
+      const confirmed = typeof window !== 'undefined' && localStorage.getItem(riskKey) === 'true'
       if (!confirmed) {
         showRiskNoticeModal = true
       } else {
-        openAntigravityOAuth()
+        openGoogleConsumerOAuth()
       }
     } else if (providerId === 'freebuff') {
       startFreebuffFlow()
@@ -1623,19 +1636,24 @@
 
   function confirmRiskAndProceed() {
     if (typeof window !== 'undefined') {
-      localStorage.setItem('ag_risk_confirmed', 'true')
+      localStorage.setItem(providerId === 'agy-acp' ? 'agcpy_risk_confirmed' : 'ag_risk_confirmed', 'true')
     }
     showRiskNoticeModal = false
-    openAntigravityOAuth()
+    openGoogleConsumerOAuth()
   }
 
-  async function openAntigravityOAuth() {
+  // antigravity and agy-acp share the Google consumer OAuth client; each
+  // exchanges into its own provider's connection rows.
+  async function openGoogleConsumerOAuth() {
     oauthError = null
     callbackInput = ''
     copiedAuthUrl = false
     try {
-      const redirectUri = antigravityCallback()
-      const res = await api.getAntigravityAuthorizeUrl(redirectUri)
+      const redirectUri = loopbackCallback()
+      const res =
+        providerId === 'agy-acp'
+          ? await api.getAGYACPAuthorizeUrl(redirectUri)
+          : await api.getAntigravityAuthorizeUrl(redirectUri)
       oauthAuthUrl = res.authUrl || res.url || res.redirectUrl
       if (res.state) {
         rememberPending({
@@ -1659,7 +1677,14 @@
     try {
       // Codex cannot use the dashboard callback: OpenAI only accepts the
       // redirect URI registered for the Codex CLI client.
-      const cb = providerId === 'codex' ? CODEX_REDIRECT_URI : dashboardCallback()
+      // Claude's public client only registers loopback callbacks, so a custom
+      // domain /callback is refused ("Redirect URI ... is not supported").
+      const cb =
+        providerId === 'codex'
+          ? CODEX_REDIRECT_URI
+          : providerId === 'claude'
+            ? loopbackCallback()
+            : dashboardCallback()
       const res = await api.pkceAuthorize(
         providerId,
         providerId === 'gitlab'
@@ -2388,7 +2413,7 @@
         }
         return
       }
-      if (providerId !== 'antigravity') {
+      if (providerId !== 'antigravity' && providerId !== 'agy-acp') {
         if (raw.includes('code=') || raw.includes('http')) {
           oauthError = `Direct OAuth login is not supported for ${providerName}. Paste an access token / refresh token instead.`
           return
@@ -2412,8 +2437,11 @@
       } catch {
         pending = null
       }
-      const exchangeRedirectUri = redirectUri || pending?.redirectUri || antigravityCallback()
-      const res = await api.antigravityExchange(code, exchangeRedirectUri, pending?.state)
+      const exchangeRedirectUri = redirectUri || pending?.redirectUri || loopbackCallback()
+      const res =
+        providerId === 'agy-acp'
+          ? await api.agyACPExchange(code, exchangeRedirectUri, pending?.state)
+          : await api.antigravityExchange(code, exchangeRedirectUri, pending?.state)
       if (res?.success === false || (res as { error?: string })?.error) {
         oauthError = (res as { error?: string })?.error || 'Authorization failed'
       } else {
@@ -2430,7 +2458,7 @@
   // Model actions
   function copyModelId(modelId: string) {
     const level = resolveThinkingSuffix(modelId)
-    const full = `${storageAlias}/${modelId}${level ? `(${level})` : ''}`
+    const full = `${displayAlias()}/${modelId}${level ? `(${level})` : ''}`
     copyToClipboard(full)
     copiedModelId = modelId
     setTimeout(() => (copiedModelId = null), 2000)
@@ -2513,15 +2541,21 @@
     modelId: string,
     caps?: { vision?: boolean; reasoning?: boolean; jailbreak?: boolean },
     limits?: { contextWindow?: number; maxOutput?: number },
+    modelType?: CustomModelType,
+    extraBody?: Record<string, unknown>,
   ) {
+    // The modal picks the kind; the id is only consulted for a caller that adds
+    // a model without going through it.
+    const kind = modelType ?? inferModelKind(modelId)
     try {
-      await api.saveCustomModel(customModelKeyFor(storageAlias, modelId), {
+      await api.saveCustomModel(customModelKeyFor(storageAlias, modelId, kind), {
         id: modelId,
         providerAlias: storageAlias,
-        type: inferModelKind(modelId),
-        ...(caps ? { caps } : {}),
+        type: kind,
+        ...(kind !== 'llm' ? {} : caps ? { caps } : {}),
         ...(limits?.contextWindow ? { contextWindow: limits.contextWindow } : {}),
         ...(limits?.maxOutput ? { maxOutput: limits.maxOutput } : {}),
+        ...(extraBody ? { extraBody } : {}),
       })
       showAddCustomModelModal = false
       const modelsData = await fetchProviderModelsData(providerId, storageAlias)
@@ -2626,8 +2660,17 @@
   }
 
   // Compatible nodes: upstream CompatibleModelsSection handlers.
+  //
+  // The prefix a model id is published under, not the provider's internal id.
+  // Upstream (providers/[id]/page.js:217) resolves it as
+  // `isCompatible ? (providerNode?.prefix || providerId) : providerAlias`,
+  // where providerAlias is the registry alias ("oc" for opencode). Returning
+  // the raw id here published "opencode/nemotron-3-ultra-free" where the
+  // gateway serves "oc/nemotron-3-ultra-free", so the copy button handed out
+  // an id the router does not resolve. The published prefix is what
+  // /v1/models serves, so it is what a copied id has to be.
   function displayAlias(): string {
-    return selectedNode?.prefix || providerId
+    return providerDisplayPrefix(providerId, selectedNode, selectedCatalogItem?.modelPrefix)
   }
 
   async function refreshCompatibleModels() {
@@ -2808,7 +2851,8 @@
   let compatibleTestSummary = $derived(formatCheckAllSummary(compatibleTestResults))
 
   function copyCompatibleModel(modelId: string) {
-    copyToClipboard(`${displayAlias()}/${modelId}`)
+    const level = resolveThinkingSuffix(modelId)
+    copyToClipboard(`${displayAlias()}/${modelId}${level ? `(${level})` : ''}`)
     copiedModelId = modelId
     setTimeout(() => (copiedModelId = null), 2000)
   }
@@ -2915,14 +2959,24 @@
             : undefined
         // An endpoint that reports its own limits is the authoritative source;
         // saving them means /v1/models keeps publishing them after the row
-        // outlives this import.
+        // outlives this import. OpenRouter-style feeds spell them snake_case
+        // (context_length / max_completion_tokens); normalized catalogues
+        // (nous, qoder, zed) spell them camelCase (contextLength /
+        // maxOutputTokens) — reading only the first shape dropped the 1M
+        // window nous/qwen4-max declares and published the 131k name guess.
         const declaredCtxLen =
-          typeof m === 'object' && m !== null && 'context_length' in m
-            ? Number(m.context_length) || 0
+          typeof m === 'object' && m !== null
+            ? Number(
+                ('context_length' in m ? m.context_length : undefined) ??
+                  ('contextLength' in m ? m.contextLength : undefined),
+              ) || 0
             : 0
         const declaredMaxOut =
-          typeof m === 'object' && m !== null && 'max_completion_tokens' in m
-            ? Number(m.max_completion_tokens) || 0
+          typeof m === 'object' && m !== null
+            ? Number(
+                ('max_completion_tokens' in m ? m.max_completion_tokens : undefined) ??
+                  ('maxOutputTokens' in m ? m.maxOutputTokens : undefined),
+              ) || 0
             : 0
         pending.push({
           id: modelId,
@@ -3871,7 +3925,7 @@
             <span class="material-symbols-outlined text-[18px]">vpn_key</span>
             {isAuthorizingFreebuff ? 'Polling Authorization...' : 'Authorize Freebuff CLI'}
           </button>
-        {:else if providerId === 'antigravity'}
+        {:else if providerId === 'antigravity' || providerId === 'agy-acp'}
           <button
             type="button"
             onclick={handleAddConnectionClick}
@@ -4419,6 +4473,24 @@
   {#if isCompatibleNode}
   <div class="bg-surface border border-border-subtle rounded-[14px] shadow-[var(--shadow-soft)] p-6">
     <div class="flex flex-col gap-4">
+      <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div class="flex flex-wrap items-center gap-3">
+          <h2 class="text-lg font-semibold">Available Models</h2>
+          {#if providerThinkingLevels}
+            <select
+              aria-label="Provider thinking mode"
+              title="Sets per-provider thinking override for requests routed to this provider"
+              value={thinkingLevel}
+              onchange={handleThinkingChange}
+              class="rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 cursor-pointer"
+            >
+              {#each providerThinkingLevels as opt (opt)}
+                <option value={opt}>Thinking: {formatThinkingOptionLabel(opt)}</option>
+              {/each}
+            </select>
+          {/if}
+        </div>
+      </div>
       <p class="text-sm text-text-muted">
         Add {isAnthropicCompatibleNode ? 'Anthropic' : 'OpenAI'}-compatible models manually or import them from the /models endpoint.
       </p>
@@ -4550,6 +4622,8 @@
       {#if compatibleRows.length > 0}
         <div class="flex flex-col gap-3">
           {#each filteredRows as row (row.id)}
+            {@const level = resolveThinkingSuffix(row.id)}
+            {@const fullModelId = `${displayAlias()}/${row.id}${level ? `(${level})` : ''}`}
             {@const tStatus = compatibleTestResults[row.id]}
             {@const tError = compatibleTestErrors[row.id]}
             {@const isTestingRow = compatibleTesting[row.id]}
@@ -4570,7 +4644,7 @@
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-medium truncate">{row.id}</p>
                 <div class="flex items-center gap-1 mt-1 flex-wrap">
-                  <code class="max-w-[72vw] truncate text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded sm:max-w-[360px]">{displayAlias()}/{row.id}</code>
+                  <code class="max-w-[72vw] truncate text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded sm:max-w-[360px]">{fullModelId}</code>
                   <!-- Capability icons, mirroring the registered grid's row:
                        the same model id can be imported into a compatible
                        node, and a row that shows nothing there reads as a
@@ -4694,13 +4768,14 @@
         {/if}
         {#if providerThinkingLevels}
         <select
-          title="Appends (level) suffix to copied model names"
+          aria-label="Provider thinking mode"
+          title="Sets per-provider thinking override (and appends (level) suffix to copied model names when supported)"
           value={thinkingLevel}
           onchange={handleThinkingChange}
-          class="rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus:outline-none cursor-pointer"
+          class="rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 cursor-pointer"
         >
           {#each providerThinkingLevels as opt (opt)}
-            <option value={opt}>Thinking: {opt.charAt(0).toUpperCase() + opt.slice(1)}</option>
+            <option value={opt}>Thinking: {formatThinkingOptionLabel(opt)}</option>
           {/each}
         </select>
         {/if}
@@ -4816,7 +4891,7 @@
     <div class="flex flex-wrap gap-3">
       {#each gridModels as model (model.id)}
         {@const level = resolveThinkingSuffix(model.id)}
-        {@const fullModelId = `${storageAlias}/${model.id}${level ? `(${level})` : ''}`}
+        {@const fullModelId = `${displayAlias()}/${model.id}${level ? `(${level})` : ''}`}
         {@const rowCaps = modelCaps[model.id] ?? model.caps}
         {@const testStatus = modelTestStatuses[model.id]}
         {@const isTestingThis = testStatus === 'testing'}

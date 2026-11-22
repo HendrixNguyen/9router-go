@@ -567,6 +567,27 @@ var KnownProviders = map[string]ProviderConfig{
 			"User-Agent":        "opencode/1.19.4",
 		},
 	},
+	// Open Design OpenDesign Cloud (open-design.ai) / AMR:
+	// https://open-design.ai/amr. Two planes on two hosts: model traffic rides
+	// the runtime key (`sk-amr-…`) at https://amr-link.open-design.ai/v1 on the
+	// lane each model declares (chat completions default; Responses for
+	// claude-haiku-5.5 / deepseek-v4-pro; Claude Messages for glm-5.3-flash),
+	// while plan/wallet/allowance read from https://amr-api.open-design.ai on the
+	// control key (`vela_ctrl_…`). ConnectionData.APIKey holds whichever
+	// credential was pasted; a pasted `vela_ctrl_…` value is a control key and
+	// rides no model request. The control key (PSD `controlKey`) and the read
+	// workspace id travel in ProviderSpecificData.
+	"opendesign": {
+		BaseURL:    "https://amr-link.open-design.ai/v1/chat/completions",
+		AuthHeader: "Authorization",
+		AuthScheme: "bearer",
+		// Quota reads live on the control plane, not the model plane: the
+		// dashboard fetcher builds it from the control host explicitly (it is
+		// never derived from this BaseURL).
+		StaticHeaders: map[string]string{
+			"User-Agent": "9router-go",
+		},
+	},
 	"gemini": {
 		BaseURL:    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
 		AuthHeader: "Authorization",
@@ -938,7 +959,11 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthHeader:    "Authorization",
 		AuthScheme:    "bearer",
 		LocalByDesign: true,
-		SystemoneURL:  "http://localhost:11434/v1/systemone",
+		// Phonon speech synthesis: the OpenAI-compatible /v1/audio/speech
+		// endpoint on the local daemon (upstream ollama-local.js ttsConfig,
+		// commit 31a9d262). Used when the connection has no custom base URL.
+		TTSURL:       "http://localhost:11434/v1/audio/speech",
+		SystemoneURL: "http://localhost:11434/v1/systemone",
 		// Saved host (providerSpecificData.baseUrl) is joined with this path.
 		SystemonePath: "/v1/systemone",
 	},
@@ -1435,6 +1460,13 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
 	},
+	// agy-acp: no HTTP endpoint — the executor spawns the official agy CLI
+	// and speaks ACP over stdio. Kept separate from antigravity (HTTP).
+	"agy-acp": {
+		BaseURL:    "agy-acp://acp/stdio",
+		AuthHeader: "Authorization",
+		AuthScheme: "bearer",
+	},
 	"kilo-gateway": {
 		BaseURL:    "https://api.kilo.ai/api/gateway/chat/completions",
 		AuthHeader: "Authorization",
@@ -1543,6 +1575,15 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
 	},
+	// DeepRelay — pay-per-token serverless inference (api.deeprelay.ai/v1).
+	// Chat completions, embeddings, image and video are all OpenAI-shaped on
+	// /v1, so ForwardOpenAI serves them. The wallet sits on
+	// GET /v1/billing/balance (used by the usage fetcher and the key probe).
+	"deeprelay": {
+		BaseURL:    "https://api.deeprelay.ai/v1/chat/completions",
+		AuthHeader: "Authorization",
+		AuthScheme: "bearer",
+	},
 }
 
 // RetryableStatusCodes are HTTP status codes that trigger account fallback.
@@ -1554,6 +1595,19 @@ var RetryableStatusCodes = map[int]bool{
 	http.StatusBadGateway:         true, // 502
 	http.StatusServiceUnavailable: true, // 503
 	http.StatusGatewayTimeout:     true, // 504
+}
+
+// RetryModelScopedError reports whether a failure outside
+// RetryableStatusCodes still carries a model-scoped verdict that the caller
+// must act on: lock this provider/model pair and leave the credential alone.
+// NVIDIA NIM answers 400 "degraded" for an unhealthy cluster behind one model
+// (upstream decolua@2275bc0d) — a 400 is otherwise request-scoped, so without
+// this the degraded model is re-dialled on every request and the account is
+// never told the cluster is sick. Keyed off the rule table, not off a
+// provider literal, so any provider-scoped modelScoped rule gets the same
+// handling.
+func RetryModelScopedError(statusCode int, errorText, provider string) bool {
+	return ClassifyErrorForProvider(statusCode, errorText, 0, provider).ModelScoped
 }
 
 // PreservesCacheControl reports whether a provider keeps the cache_control

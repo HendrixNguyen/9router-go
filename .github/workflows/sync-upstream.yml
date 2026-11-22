@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
 
 jobs:
@@ -19,11 +19,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configure Git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
       - name: Fetch and check upstream
         id: check
         run: |
@@ -33,24 +28,28 @@ jobs:
           echo "behind_count=$BEHIND_COUNT" >> "$GITHUB_OUTPUT"
           echo "Upstream has $BEHIND_COUNT new commit(s)"
 
-      - name: Push upstream-sync branch and open PR
+      - name: Create or update upstream sync PR
         if: steps.check.outputs.behind_count != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEHIND_COUNT: ${{ steps.check.outputs.behind_count }}
         run: |
-          git checkout -B upstream-sync upstream/main
-          git push -f origin upstream-sync
+          UPSTREAM_COMMITS=$(git log --oneline HEAD..upstream/main)
+          TITLE="chore: sync with upstream luqman-v1/9router-go ($(date +'%Y-%m-%d'))"
+          BODY=$(printf "### Upstream Sync\n\nNew commits detected on \`luqman-v1/9router-go:main\` (%s commit(s)):\n\n\`\`\`\n%s\n\`\`\`\n\nPlease review changes before merging into \`main\`. Merging to \`main\` will automatically trigger Docker build and push to Docker Hub." "$BEHIND_COUNT" "$UPSTREAM_COMMITS")
 
-          EXISTING_PR=$(gh pr list --repo "${{ github.repository }}" --head upstream-sync --state open --json number -q '.[0].number')
+          EXISTING_PR=$(gh api "repos/${{ github.repository }}/pulls?state=open&head=luqman-v1:main&base=main" --jq '.[0].number // empty')
           if [ -n "$EXISTING_PR" ]; then
+            gh api --method PATCH "repos/${{ github.repository }}/pulls/$EXISTING_PR" \
+              -f title="$TITLE" \
+              -f body="$BODY" > /dev/null
             echo "Sync PR #$EXISTING_PR is already open and updated with latest commits."
           else
-            UPSTREAM_COMMITS=$(git log --oneline -n "${{ steps.check.outputs.behind_count }}" upstream/main)
-            BODY=$(printf "### Upstream Sync\n\nNew commits detected on \`luqman-v1/9router-go:main\` (%s commit(s)):\n\n\`\`\`\n%s\n\`\`\`\n\nPlease review changes before merging into \`main\`. Merging to \`main\` will automatically trigger Docker build and push to Docker Hub." "${{ steps.check.outputs.behind_count }}" "$UPSTREAM_COMMITS")
-
-            gh pr create --repo "${{ github.repository }}" \
-              --base main \
-              --head upstream-sync \
-              --title "chore: sync with upstream luqman-v1/9router-go ($(date +'%Y-%m-%d'))" \
-              --body "$BODY"
+            PR_URL=$(gh api "repos/${{ github.repository }}/pulls" \
+              -f title="$TITLE" \
+              -f head="luqman-v1:main" \
+              -f base="main" \
+              -f body="$BODY" \
+              --jq '.html_url')
+            echo "Created sync PR: $PR_URL"
           fi
